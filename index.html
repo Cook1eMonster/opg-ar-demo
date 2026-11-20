@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>OPG AR Overlay</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#eee;font:14px/1.3 system-ui,sans-serif;overflow:hidden;touch-action:none}
+#gl{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain}
+#hud{position:fixed;top:8px;left:8px;right:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;z-index:2}
+#st{background:#0009;padding:6px 10px;border-radius:8px;font-size:13px}
+#bar{position:fixed;left:0;right:0;bottom:0;background:#000b;padding:8px 10px calc(8px + env(safe-area-inset-bottom));z-index:2}
+.row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px}
+button,label.b{background:#2a6f97;color:#fff;border:0;border-radius:8px;padding:10px 12px;font-size:14px;min-height:40px}
+button.off{background:#444}
+input[type=file]{display:none}
+.sl{display:grid;grid-template-columns:70px 1fr;gap:4px 8px;align-items:center;font-size:12px}
+input[type=range]{width:100%}
+#start{position:fixed;inset:0;display:flex;flex-direction:column;gap:14px;align-items:center;justify-content:center;z-index:3;background:#000;text-align:center;padding:24px}
+#start h1{font-size:22px;margin:0}
+#start p{max-width:420px;color:#aaa;margin:0}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="start">
+  <h1>OPG → face AR overlay</h1>
+  <p>Load the panoramic X-ray from your phone, then start the camera. Images stay on this device.</p>
+  <label class="b">1 · Load X-ray<input id="fx" type="file" accept="image/*"></label>
+  <button id="go">2 · Start camera</button>
+  <label class="b" style="background:#555">or test on a photo<input id="fp" type="file" accept="image/*"></label>
+  <p id="msg"></p>
+  <p style="font-size:12px">Demo prototype — not for clinical use. The OPG is a flattened projection; alignment is approximate.</p>
+</div>
+<div id="hud" class="hide"><span id="st">loading…</span></div>
+<div id="bar" class="hide">
+  <div class="row">
+    <button id="bLock" class="off">Lock</button>
+    <button id="bRot">Rot 0°</button>
+    <button id="bFlip" class="off">Flip</button>
+    <button id="bMesh" class="off">Mesh</button>
+    <button id="bMan" class="off">Manual</button>
+    <button id="bUi">Hide</button>
+  </div>
+  <div class="sl" id="sliders">
+    <span>Opacity</span><input id="sO" type="range" min="0" max="1" step="0.01" value="0.75">
+    <span>Height</span><input id="sH" type="range" min="0.4" max="2" step="0.01" value="1">
+    <span>Shift ↕</span><input id="sY" type="range" min="-0.6" max="0.6" step="0.01" value="0">
+    <span>Width</span><input id="sW" type="range" min="0.6" max="1.6" step="0.01" value="1">
+    <span>Threshold</span><input id="sT" type="range" min="0" max="0.6" step="0.01" value="0.08">
+  </div>
+</div>
+<script type="module">
+import {FaceLandmarker, FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const $=id=>document.getElementById(id);
+const st=t=>$('st').textContent=t;
+
+// ---- OPG calibration (fractions of the overlay image) ----
+// x: patient's right gonion, midline, patient's left gonion. y: occlusal plane, lower mandibular border at gonion / at menton
+const CAL={gR:0.11,mid:0.50,gL:0.88,occ:0.60,bG:0.76,bM:0.89};
+// MediaPipe jaw contour, patient's right gonion -> menton(152) -> patient's left gonion
+const JAW=[58,172,136,150,149,176,148,152,377,400,378,379,365,397,288];
+const MENTON=152, STOMION_U=13, STOMION_L=14;
+
+let xrImg=null, src=null, srcIsVideo=false, video=null, still=null;
+let landmarker=null, lastLm=null, smooth=null, locked=false, rot=0, miss=0, flip=false, showMesh=false, manual=false;
+let man={x:0.5,y:0.6,s:0.5,a:0};
+
+$('fx').onchange=e=>loadImg(e.target.files[0],im=>{xrImg=im;$('msg').textContent='X-ray loaded ✓';uploadTex(texX,im);});
+$('fp').onchange=e=>loadImg(e.target.files[0],im=>{still=im;srcIsVideo=false;src=im;begin();});
+$('go').onclick=async()=>{
+  try{
+    video=document.createElement('video');video.playsInline=true;video.muted=true;
+    video.srcObject=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},audio:false});
+    await video.play();srcIsVideo=true;src=video;begin();
+  }catch(err){$('msg').textContent='Camera error: '+err.message+' (needs https + permission)';}
+};
+function loadImg(f,cb){if(!f)return;const im=new Image();im.onload=()=>cb(im);im.src=URL.createObjectURL(f);}
+
+// ---- WebGL ----
+const cv=$('gl'), gl=cv.getContext('webgl',{premultipliedAlpha:false,alpha:false});
+function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);return o;}
+function prog(vs,fs){const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,vs));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(p);return p;}
+const VS=`attribute vec2 p;attribute vec2 t;uniform vec2 sz;varying vec2 v;void main(){v=t;gl_Position=vec4(p.x/sz.x*2.-1.,1.-p.y/sz.y*2.,0,1);}`;
+const pV=prog(VS,`precision mediump float;varying vec2 v;uniform sampler2D tx;void main(){gl_FragColor=texture2D(tx,v);}`);
+const pX=prog(VS,`precision mediump float;varying vec2 v;uniform sampler2D tx;uniform float op,th;
+void main(){vec4 c=texture2D(tx,v);float l=dot(c.rgb,vec3(.3,.59,.11));float a=c.a*smoothstep(th,th+.35,l);
+if(v.x<0.||v.x>1.||v.y<0.||v.y>1.)a=0.;gl_FragColor=vec4(mix(vec3(.75,.9,1.),vec3(1.),l)*l*1.2,a*op);}`);
+const pL=prog(VS,`precision mediump float;varying vec2 v;void main(){gl_FragColor=vec4(0.,1.,.6,.9);}`);
+const bP=gl.createBuffer(), bT=gl.createBuffer(), bI=gl.createBuffer();
+function mkTex(){const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+  for(const [k,v] of [[gl.TEXTURE_MIN_FILTER,gl.LINEAR],[gl.TEXTURE_MAG_FILTER,gl.LINEAR],[gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE],[gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE]])gl.texParameteri(gl.TEXTURE_2D,k,v);return t;}
+const texV=mkTex(), texX=mkTex();
+function uploadTex(t,el){gl.bindTexture(gl.TEXTURE_2D,t);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,el);}
+function draw(p,pos,tex,idx,mode,count){
+  gl.useProgram(p);gl.uniform2f(gl.getUniformLocation(p,'sz'),cv.width,cv.height);
+  const lp=gl.getAttribLocation(p,'p'),lt=gl.getAttribLocation(p,'t');
+  gl.bindBuffer(gl.ARRAY_BUFFER,bP);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(pos),gl.DYNAMIC_DRAW);gl.enableVertexAttribArray(lp);gl.vertexAttribPointer(lp,2,gl.FLOAT,false,0,0);
+  if(lt>=0){gl.bindBuffer(gl.ARRAY_BUFFER,bT);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(tex),gl.DYNAMIC_DRAW);gl.enableVertexAttribArray(lt);gl.vertexAttribPointer(lt,2,gl.FLOAT,false,0,0);}
+  if(idx){gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,bI);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(idx),gl.DYNAMIC_DRAW);gl.drawElements(mode,idx.length,gl.UNSIGNED_SHORT,0);}
+  else gl.drawArrays(mode,0,count);
+}
+
+// ---- detection with rotation (supine patient => face often sideways / upside down) ----
+const rc=document.createElement('canvas'), rx=rc.getContext('2d');
+function srcSize(){return srcIsVideo?[video.videoWidth,video.videoHeight]:[still.naturalWidth,still.naturalHeight];}
+function detect(ts){
+  const [W,H]=srcSize(); const sw=rot%180?H:W, shh=rot%180?W:H;
+  if(rc.width!==sw||rc.height!==shh){rc.width=sw;rc.height=shh;}
+  rx.setTransform(1,0,0,1,0,0);rx.translate(sw/2,shh/2);rx.rotate(rot*Math.PI/180);rx.drawImage(src,-W/2,-H/2);
+  const r=landmarker.detectForVideo(rc,ts);
+  if(!r.faceLandmarks||!r.faceLandmarks.length)return null;
+  // map back to source pixel coords
+  const c=Math.cos(-rot*Math.PI/180), s=Math.sin(-rot*Math.PI/180);
+  return r.faceLandmarks[0].map(q=>{const x=q.x*sw-sw/2,y=q.y*shh-shh/2;return [x*c-y*s+W/2,x*s+y*c+H/2];});
+}
+
+// ---- mesh: unroll the OPG along the jaw ----
+function buildMesh(L){
+  const O=+$('sO').value,Hs=+$('sH').value,Ys=+$('sY').value,Ws=+$('sW').value;
+  let jaw=JAW.map(i=>L[i]); if(flip)jaw=jaw.slice().reverse();
+  const stom=[(L[STOMION_U][0]+L[STOMION_L][0])/2,(L[STOMION_U][1]+L[STOMION_L][1])/2], men=L[MENTON];
+  const up=[stom[0]-men[0],stom[1]-men[1]]; // menton -> stomion
+  // arc length param, midline (menton, index 7) pinned at u=0.5
+  const cum=[0];for(let i=1;i<jaw.length;i++)cum.push(cum[i-1]+Math.hypot(jaw[i][0]-jaw[i-1][0],jaw[i][1]-jaw[i-1][1]));
+  const m=7,uOf=i=>i<=m?0.5*cum[i]/cum[m]:0.5+0.5*(cum[i]-cum[m])/(cum[jaw.length-1]-cum[m]);
+  const jawAt=u=>{ // u in face-param space, extrapolate beyond ends
+    if(u<=0){const d=[jaw[0][0]-jaw[1][0],jaw[0][1]-jaw[1][1]],du=uOf(1);return [jaw[0][0]+d[0]*(-u/du),jaw[0][1]+d[1]*(-u/du)];}
+    if(u>=1){const n=jaw.length-1,d=[jaw[n][0]-jaw[n-1][0],jaw[n][1]-jaw[n-1][1]],du=1-uOf(n-1);return [jaw[n][0]+d[0]*((u-1)/du),jaw[n][1]+d[1]*((u-1)/du)];}
+    for(let i=1;i<jaw.length;i++){const a=uOf(i-1),b=uOf(i);if(u<=b){const t=(u-a)/(b-a);return [jaw[i-1][0]+(jaw[i][0]-jaw[i-1][0])*t,jaw[i-1][1]+(jaw[i][1]-jaw[i-1][1])*t];}}
+  };
+  const C=28,R=10,pos=[],tex=[],idx=[];
+  for(let ci=0;ci<=C;ci++){
+    const tx=ci/C;                       // texture x 0..1
+    let u=tx<CAL.mid?0.5*(tx-CAL.gR)/(CAL.mid-CAL.gR):0.5+0.5*(tx-CAL.mid)/(CAL.gL-CAL.mid); // face param
+    u=0.5+(u-0.5)/Ws;
+    const j=jawAt(u);
+    const e=Math.abs(u-0.5)*2, borderY=CAL.bM+(CAL.bG-CAL.bM)*Math.min(e,1.2); // OPG border y for this column
+    const occK=(borderY-CAL.occ)/(CAL.bM-CAL.occ);  // occlusal height relative to midline
+    const occ=[j[0]+up[0]*occK*Hs+up[0]*Ys,j[1]+up[1]*occK*Hs+up[1]*Ys];
+    const jb=[j[0]+up[0]*Ys,j[1]+up[1]*Ys];
+    for(let ri=0;ri<=R;ri++){
+      const ty=ri/R, k=(ty-CAL.occ)/(borderY-CAL.occ); // 0 at occlusal, 1 at border
+      pos.push(occ[0]+(jb[0]-occ[0])*k, occ[1]+(jb[1]-occ[1])*k); tex.push(tx,ty);
+    }
+  }
+  for(let ci=0;ci<C;ci++)for(let ri=0;ri<R;ri++){const a=ci*(R+1)+ri,b=a+R+1;idx.push(a,b,a+1,a+1,b,b+1);}
+  return {pos,tex,idx,O};
+}
+function manualMesh(W,H){
+  const w=W*man.s,h=w*(xrImg?xrImg.naturalHeight/xrImg.naturalWidth:0.55),c=Math.cos(man.a),s=Math.sin(man.a),cx=man.x*W,cy=man.y*H;
+  const P=[[-w/2,-h/2],[w/2,-h/2],[-w/2,h/2],[w/2,h/2]].map(([x,y])=>[cx+x*c-y*s,cy+x*s+y*c]);
+  return {pos:P.flat(),tex:[0,0,1,0,0,1,1,1],idx:[0,1,2,2,1,3],O:+$('sO').value};
+}
+
+// ---- main loop ----
+let t0=performance.now(), frames=0, fps=0;
+async function begin(){
+  if(!xrImg){$('msg').textContent='Load the X-ray first.';return;}
+  $('start').classList.add('hide');$('hud').classList.remove('hide');$('bar').classList.remove('hide');
+  if(!landmarker){
+    st('loading face model…');
+    const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    const opt=d=>({baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",delegate:d},runningMode:"VIDEO",numFaces:1,minFaceDetectionConfidence:0.3,minFacePresenceConfidence:0.3,minTrackingConfidence:0.3});
+    try{landmarker=await FaceLandmarker.createFromOptions(fs,opt("GPU"));}catch(e){landmarker=await FaceLandmarker.createFromOptions(fs,opt("CPU"));}
+  }
+  requestAnimationFrame(loop);
+}
+let ts=0;
+function loop(){
+  const [W,H]=srcSize(); if(!W){requestAnimationFrame(loop);return;}
+  if(cv.width!==W||cv.height!==H){cv.width=W;cv.height=H;gl.viewport(0,0,W,H);}
+  uploadTex(texV,src);
+  if(!locked&&!manual){
+    ts=Math.max(ts+1,performance.now());
+    const L=detect(ts);
+    if(L){miss=0;smooth=smooth&&smooth.length===L.length?smooth.map((p,i)=>[p[0]*0.45+L[i][0]*0.55,p[1]*0.45+L[i][1]*0.55]):L;lastLm=smooth;}
+    else if(++miss>12){miss=0;rot=(rot+90)%360;$('bRot').textContent='Rot '+rot+'°';smooth=null;} // auto-try next orientation
+  }
+  gl.disable(gl.BLEND);gl.bindTexture(gl.TEXTURE_2D,texV);
+  draw(pV,[0,0,W,0,0,H,W,H],[0,0,1,0,0,1,1,1],null,gl.TRIANGLE_STRIP,4);
+  const M=manual?manualMesh(W,H):(lastLm?buildMesh(lastLm):null);
+  if(M){
+    gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(pX);gl.uniform1f(gl.getUniformLocation(pX,'op'),M.O);gl.uniform1f(gl.getUniformLocation(pX,'th'),+$('sT').value);
+    gl.bindTexture(gl.TEXTURE_2D,texX);draw(pX,M.pos,M.tex,M.idx,gl.TRIANGLES);
+    if(showMesh){const li=[];for(let i=0;i<M.idx.length;i+=3){const[a,b,c]=M.idx.slice(i,i+3);li.push(a,b,b,c,c,a);}draw(pL,M.pos,M.tex,li,gl.LINES);}
+  }
+  frames++;const n=performance.now();if(n-t0>1000){fps=frames;frames=0;t0=n;}
+  st(manual?'Manual · drag / pinch / twist':locked?'Locked':(lastLm&&miss===0?'Tracking ✓':'Searching face… rot '+rot+'°')+' · '+fps+' fps');
+  requestAnimationFrame(loop);
+}
+
+// ---- controls ----
+const tog=(b,v)=>b.classList.toggle('off',!v);
+$('bLock').onclick=e=>{locked=!locked;tog(e.target,locked);};
+$('bRot').onclick=e=>{rot=(rot+90)%360;smooth=null;miss=-60;e.target.textContent='Rot '+rot+'°';};
+$('bFlip').onclick=e=>{flip=!flip;tog(e.target,flip);};
+$('bMesh').onclick=e=>{showMesh=!showMesh;tog(e.target,showMesh);};
+$('bMan').onclick=e=>{manual=!manual;tog(e.target,manual);};
+$('bUi').onclick=()=>{$('sliders').classList.toggle('hide');$('bUi').textContent=$('sliders').classList.contains('hide')?'Show':'Hide';};
+
+// manual gestures (screen -> source coords accounting for object-fit:contain)
+const pts=new Map();let g0=null;
+function toSrc(e){const r=cv.getBoundingClientRect(),[W,H]=srcSize(),k=Math.min(r.width/W,r.height/H),ox=(r.width-W*k)/2,oy=(r.height-H*k)/2;return [(e.clientX-r.left-ox)/k/W,(e.clientY-r.top-oy)/k/H];}
+function gstate(){const a=[...pts.values()];if(a.length===1)return {c:a[0]};const[p,q]=a;return {c:[(p[0]+q[0])/2,(p[1]+q[1])/2],d:Math.hypot(p[0]-q[0],p[1]-q[1]),a:Math.atan2(q[1]-p[1],q[0]-p[0])};}
+cv.addEventListener('pointerdown',e=>{if(!manual)return;pts.set(e.pointerId,toSrc(e));g0={g:gstate(),m:{...man}};});
+cv.addEventListener('pointermove',e=>{if(!manual||!pts.has(e.pointerId))return;pts.set(e.pointerId,toSrc(e));const g=gstate();
+  man.x=g0.m.x+g.c[0]-g0.g.c[0];man.y=g0.m.y+g.c[1]-g0.g.c[1];if(g.d&&g0.g.d){man.s=g0.m.s*g.d/g0.g.d;man.a=g0.m.a+g.a-g0.g.a;}});
+const up=e=>{pts.delete(e.pointerId);if(pts.size)g0={g:gstate(),m:{...man}};};
+cv.addEventListener('pointerup',up);cv.addEventListener('pointercancel',up);
+</script>
+</body>
+</html>
